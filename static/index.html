@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>FROST Measurement</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 40px auto; padding: 0 16px; }
+  label { display: block; margin-top: 12px; font-size: 14px; }
+  input { font-size: 14px; padding: 4px 8px; width: 100px; }
+  button { margin-top: 16px; padding: 10px 20px; font-size: 15px; cursor: pointer; }
+  #status { margin-top: 16px; padding: 12px; background: #f0f0f0; border-radius: 6px; font-family: monospace; font-size: 13px; white-space: pre-wrap; min-height: 40px; }
+  .warn { color: #a00; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h2>FROST SSD Timing Measurement</h2>
+  <p class="warn">
+    File size (GB) must be larger than your laptop's RAM, or the OS page
+    cache will hide the SSD signal.
+    (e.g. 8GB RAM → use 10+, 16GB RAM → use 20+)
+  </p>
+
+  <label>
+    Label (e.g. idle, youtube, github)
+    <input id="label" type="text" value="idle" style="width: 200px;" />
+  </label>
+
+  <label>
+    File size (GB)
+    <input id="sizeGB" type="number" value="10" />
+  </label>
+
+  <label>
+    Duration (seconds)
+    <input id="durationSec" type="number" value="10" />
+  </label>
+
+  <button id="runBtn">Start Measurement</button>
+
+  <div id="status">Waiting...</div>
+
+  <script src="/attacker.js"></script>
+  <script>
+    document.getElementById("runBtn").addEventListener("click", async () => {
+      const label = document.getElementById("label").value || "unlabeled";
+      const sizeGB = parseFloat(document.getElementById("sizeGB").value);
+      const durationMs = parseFloat(document.getElementById("durationSec").value) * 1000;
+      const statusEl = document.getElementById("status");
+
+      document.getElementById("runBtn").disabled = true;
+      try {
+        await runAttack({
+          label,
+          sizeGB,
+          durationMs,
+          onStatus: (msg) => { statusEl.textContent = msg; },
+        });
+      } catch (e) {
+        statusEl.textContent = "Error: " + e.message;
+        console.error(e);
+      } finally {
+        document.getElementById("runBtn").disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
