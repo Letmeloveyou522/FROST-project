@@ -39,6 +39,8 @@ async function createLargeFile(sizeGB, onProgress) {
   const targetSize = sizeGB * 1024 * 1024 * 1024;
   const existingSize = accessHandle.getSize();
 
+  // [주석 추가] 파일은 앞에서부터 순서대로 쓰이므로, 크기가 목표에 도달했다면
+  // 쓰기가 끝까지 완료된 것이다. 중간에 끊긴 파일은 크기가 작아서 여기서 걸러지고 다시 쓰인다.
   if (existingSize >= targetSize) {
     return accessHandle; // already big enough, reuse as-is
   }
@@ -78,9 +80,16 @@ function measureTrace(accessHandle, durationMs, onTick) {
 
 self.onmessage = async (e) => {
   const { label, sizeGB, durationMs } = e.data;
+  // [수정] 에러가 나도 핸들을 닫을 수 있도록 밖으로 뺐다.
+  let accessHandle = null;
   try {
+    // [수정] 잘못된 입력(빈칸, 음수, 문자 등)은 측정 전에 막는다.
+    if (!(sizeGB > 0) || !(durationMs > 0)) {
+      throw new Error("File size and duration must be positive numbers");
+    }
+
     self.postMessage({ type: "status", msg: `Preparing ${sizeGB} GB file (slow only on first run)...` });
-    const accessHandle = await createLargeFile(sizeGB, (p) =>
+    accessHandle = await createLargeFile(sizeGB, (p) =>
       self.postMessage({ type: "status", msg: `Filling file: ${(p * 100).toFixed(0)}%` })
     );
 
@@ -89,9 +98,13 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
     );
     accessHandle.close();
+    accessHandle = null;
 
-    self.postMessage({ type: "done", label, trace });
+    // [수정] 측정 조건(sizeGB, durationMs)을 메인 스레드로 다시 돌려보낸다. 서버 저장에 쓰인다.
+    self.postMessage({ type: "done", label, trace, sizeGB, durationMs });
   } catch (err) {
+    // [수정] 에러 시에도 핸들을 닫아서, 다음 측정에서 파일이 잠겨 있는 문제를 막는다.
+    if (accessHandle) accessHandle.close();
     self.postMessage({ type: "error", message: err.message });
   }
 };
