@@ -1,161 +1,83 @@
-
 from flask import Flask, send_from_directory, request, jsonify
-from pathlib import Path
 import json
 import time
-import math
-import re
+import os
 
 app = Flask(__name__, static_folder="static")
 
-# Project directories
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+TRACE_FILE = "traces.jsonl"
 
-# Automatically create the data directory
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# Measurement metadata
-META_FIELDS = [
-    "session",
-    "sizeGB",
-    "durationMs",
-    "startedAt",
-    "userAgent"
-]
+# [수정] 측정 조건을 기록하는 필드 목록. 나중에 세션별, 파일 크기별로 데이터를 나누기 위해 필요하다.
+# 브라우저가 이 값을 보내지 않으면 None으로 저장된다.
+META_FIELDS = ["session", "sizeGB", "durationMs", "startedAt", "userAgent"]
 
 
+# [수정] 요청 데이터가 올바른지 확인한다. 문제가 있으면 에러 메시지를, 없으면 None을 돌려준다.
 def validate(data):
-    """Validate incoming measurement data."""
-
-    if not isinstance(data, dict):
-        return "expected a JSON object"
-
-    if "label" not in data or "trace" not in data:
+    if not data or "label" not in data or "trace" not in data:
         return "expected {label, trace}"
-
-    label = data["label"]
-
-    if not isinstance(label, str) or not label.strip():
+    if not isinstance(data["label"], str) or not data["label"].strip():
         return "label must be a non-empty string"
-
-    # Prevent unsafe filenames and path traversal
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
-        return "label must contain only letters, numbers, _ or -"
-
     trace = data["trace"]
-
     if not isinstance(trace, list) or len(trace) == 0:
         return "trace must be a non-empty list"
-
-    if not all(
-        isinstance(x, (int, float))
-        and not isinstance(x, bool)
-        and math.isfinite(x)
-        for x in trace
-    ):
-        return "trace must contain only finite numbers"
-
+    # 지연값은 숫자여야 한다. 문자열이 섞이면 분석 단계에서 깨진다.
+    if not all(isinstance(x, (int, float)) for x in trace):
+        return "trace must contain only numbers"
     return None
 
 
 @app.after_request
 def add_coop_coep_headers(response):
-    # Preserve high-resolution timing configuration
-    response.headers[
-        "Cross-Origin-Opener-Policy"
-    ] = "same-origin"
-
-    response.headers[
-        "Cross-Origin-Embedder-Policy"
-    ] = "require-corp"
-
+    # These headers are required to unlock high-resolution performance.now()
+    # Without them, Chrome/Firefox round timings to ~100us-1ms, which hides
+    # the SSD latency differences we're trying to measure.
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
     return response
 
 
 @app.route("/")
 def index():
-    return send_from_directory(
-        app.static_folder,
-        "index.html"
-    )
+    return send_from_directory(app.static_folder, "index.html")
 
 
 @app.route("/attacker.js")
 def attacker_js():
-    return send_from_directory(
-        app.static_folder,
-        "attacker.js"
-    )
+    return send_from_directory(app.static_folder, "attacker.js")
 
 
 @app.route("/worker.js")
 def worker_js():
-    return send_from_directory(
-        app.static_folder,
-        "worker.js"
-    )
+    return send_from_directory(app.static_folder, "worker.js")
 
 
 @app.route("/submit", methods=["POST"])
 def submit():
+    # [수정] silent=True: JSON이 아니면 예외 대신 None을 돌려줘서 아래 검사에서 400으로 처리된다.
     data = request.get_json(silent=True)
-
     error = validate(data)
-
     if error:
         return jsonify({"error": error}), 400
 
-    # Preserve original measurement data
     record = {
         "label": data["label"],
         "trace": data["trace"],
         "ts": time.time(),
     }
-
-    # Preserve measurement metadata
+    # [수정] 측정 조건 메타데이터를 같이 저장한다.
     for field in META_FIELDS:
         record[field] = data.get(field)
 
-    # Automatically select a file based on label
-    label = record["label"]
+    with open(TRACE_FILE, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
-    trace_file = DATA_DIR / f"{label}.jsonl"
-
-    # Append measurements without overwriting old runs
-    with trace_file.open(
-        "a",
-        encoding="utf-8"
-    ) as f:
-        f.write(
-            json.dumps(
-                record,
-                ensure_ascii=False
-            ) + "\n"
-        )
-
-    print(
-        f"[saved] label={record['label']} "
-        f"session={record['session']} "
-        f"sizeGB={record['sizeGB']} "
-        f"samples={len(record['trace'])}"
-    )
-
-    print(f"[file] {trace_file}")
-
-    return jsonify({
-        "status": "ok",
-        "label": label,
-        "samples": len(record["trace"]),
-        "file": f"data/{label}.jsonl"
-    })
+    print(f"[saved] label={record['label']} session={record['session']} "
+          f"sizeGB={record['sizeGB']} samples={len(record['trace'])}")
+    return jsonify({"status": "ok", "samples": len(record["trace"])})
 
 
 if __name__ == "__main__":
     print("Server running at http://localhost:8000")
-    print(f"Trace directory: {DATA_DIR}")
-
-    app.run(
-        port=8000,
-        debug=True
-    )
+    print(f"Traces will be appended to {os.path.abspath(TRACE_FILE)}")
+    app.run(port=8000, debug=True)
