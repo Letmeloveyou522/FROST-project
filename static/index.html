@@ -25,9 +25,16 @@
     <input id="label" type="text" value="idle" style="width: 200px;" />
   </label>
 
+  <!-- [수정] 세션 입력칸 추가. 기본값은 오늘 날짜(YYYY-MM-DD)다. -->
+  <label>
+    Session (same day / same run group)
+    <input id="session" type="text" style="width: 200px;" />
+  </label>
+
   <label>
     File size (GB)
-    <input id="sizeGB" type="number" value="10" />
+    <!-- [수정] 기본값 10 → 20. 16GB RAM 기기에서 10GB면 캐시에 다 들어가서 신호가 안 나온다. -->
+    <input id="sizeGB" type="number" value="20" />
   </label>
 
   <label>
@@ -41,8 +48,13 @@
 
   <script src="/attacker.js"></script>
   <script>
+    // [수정] 세션 기본값을 오늘 날짜로 채운다.
+    // "sv-SE" 로케일은 YYYY-MM-DD 형식으로 출력되는 것을 이용한 방법이다.
+    document.getElementById("session").value = new Date().toLocaleDateString("sv-SE");
+
     document.getElementById("runBtn").addEventListener("click", async () => {
       const label = document.getElementById("label").value || "unlabeled";
+      const session = document.getElementById("session").value || "unsessioned";
       const sizeGB = parseFloat(document.getElementById("sizeGB").value);
       const durationMs = parseFloat(document.getElementById("durationSec").value) * 1000;
       const statusEl = document.getElementById("status");
@@ -53,6 +65,7 @@
           label,
           sizeGB,
           durationMs,
+          session,
           onStatus: (msg) => { statusEl.textContent = msg; },
         });
       } catch (e) {
