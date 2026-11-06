@@ -1,7 +1,6 @@
 // Main-thread orchestrator. The actual OPFS reads/writes happen inside
 // worker.js, because createSyncAccessHandle() only works in a Worker.
 
-// [수정] session 인자를 추가했다. 같은 날·같은 세션에서 모은 데이터를 묶기 위한 값이다.
 function runAttack({ label, sizeGB, durationMs, session, onStatus }) {
   return new Promise((resolve, reject) => {
     // [수정] 측정 시작 시각을 기록한다. 나중에 측정 순서나 시간대를 확인할 때 쓴다.
