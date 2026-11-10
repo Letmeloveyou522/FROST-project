@@ -1,7 +1,9 @@
 // Main-thread orchestrator. The actual OPFS reads/writes happen inside
 // worker.js, because createSyncAccessHandle() only works in a Worker.
 
-function runAttack({ label, sizeGB, durationMs, session, onStatus }) {
+// onMeasureStart: optional callback fired the instant the worker starts recording.
+// extra: optional object merged into the /submit payload (auto-mode metadata).
+function runAttack({ label, sizeGB, durationMs, session, onStatus, onMeasureStart, extra }) {
   return new Promise((resolve, reject) => {
     // [수정] 측정 시작 시각을 기록한다. 나중에 측정 순서나 시간대를 확인할 때 쓴다.
     const startedAt = new Date().toISOString();
@@ -12,6 +14,11 @@ function runAttack({ label, sizeGB, durationMs, session, onStatus }) {
 
       if (msg.type === "status") {
         onStatus(msg.msg);
+        return;
+      }
+
+      if (msg.type === "measuring") {
+        if (onMeasureStart) onMeasureStart();
         return;
       }
 
@@ -38,6 +45,7 @@ function runAttack({ label, sizeGB, durationMs, session, onStatus }) {
               session,
               startedAt,
               userAgent: navigator.userAgent,
+              ...(extra || {}),
             }),
           });
           const result = await res.json();

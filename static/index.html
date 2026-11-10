@@ -44,6 +44,45 @@
 
   <button id="runBtn">Start Measurement</button>
 
+  <h3 style="margin-top: 32px;">Auto collection</h3>
+  <p style="font-size: 13px; color: #555;">
+    Runs N trials with the label/session/size/duration above, following the FROST
+    paper: before each trial the OS page cache is reset and the system settles for
+    the buffer time. Recording then starts, the link opens as a new tab in this
+    browser at a fixed time (paper: 10 s trace, open at 2 s), and the tab closes
+    when recording ends. Leave the link empty to collect idle traces.
+    This page must be open in the browser started by
+    <code>python server.py --launch-browser</code>.
+  </p>
+
+  <label>
+    Link
+    <input id="autoUrl" type="text" placeholder="https://www.youtube.com/watch?v=..." style="width: 100%; box-sizing: border-box;" />
+  </label>
+
+  <label>
+    Number of trials
+    <input id="autoTrials" type="number" value="20" min="1" />
+  </label>
+
+  <label>
+    Open link at (seconds after recording starts)
+    <input id="autoOpenDelay" type="number" value="2" min="0" step="0.1" />
+  </label>
+
+  <label>
+    Buffer before each trial, after the cache reset (seconds)
+    <input id="autoBuffer" type="number" value="5" min="0" step="0.5" />
+  </label>
+
+  <label>
+    <input id="autoCacheReset" type="checkbox" checked style="width: auto;" />
+    Reset OS page cache before each trial
+  </label>
+
+  <button id="autoBtn">Start Auto Collection</button>
+  <button id="stopBtn" disabled>Stop</button>
+
   <div id="status">Waiting...</div>
 
   <script src="/attacker.js"></script>
@@ -73,6 +112,140 @@
         console.error(e);
       } finally {
         document.getElementById("runBtn").disabled = false;
+      }
+    });
+
+    // ---------------- Auto collection ----------------
+    let stopRequested = false;
+
+    const postJSON = (path, body) =>
+      fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+
+    // Sleep that can be interrupted by Stop
+    const sleep = (ms) =>
+      new Promise((resolve) => {
+        const end = Date.now() + ms;
+        const tick = () => (stopRequested || Date.now() >= end ? resolve() : setTimeout(tick, 100));
+        tick();
+      });
+
+    // Stops after the current trial; its tab still closes on schedule, so the
+    // trace being recorded is not cut short.
+    document.getElementById("stopBtn").addEventListener("click", () => {
+      stopRequested = true;
+      document.getElementById("stopBtn").disabled = true;
+    });
+
+    document.getElementById("autoBtn").addEventListener("click", async () => {
+      const label = document.getElementById("label").value || "unlabeled";
+      const session = document.getElementById("session").value || "unsessioned";
+      const sizeGB = parseFloat(document.getElementById("sizeGB").value);
+      const durationMs = parseFloat(document.getElementById("durationSec").value) * 1000;
+      const url = document.getElementById("autoUrl").value.trim();
+      const trials = parseInt(document.getElementById("autoTrials").value, 10);
+      const openDelayMs = parseFloat(document.getElementById("autoOpenDelay").value) * 1000;
+      const bufferMs = parseFloat(document.getElementById("autoBuffer").value) * 1000;
+      const cacheReset = document.getElementById("autoCacheReset").checked;
+      const statusEl = document.getElementById("status");
+
+      if (!(trials > 0)) { statusEl.textContent = "Number of trials must be at least 1"; return; }
+      if (url) {
+        if (!/^https?:\/\//.test(url)) { statusEl.textContent = "Link must start with http:// or https://"; return; }
+        if (!(openDelayMs >= 0) || openDelayMs >= durationMs) {
+          statusEl.textContent = "Open time must be >= 0 and shorter than the duration"; return;
+        }
+        const cfg = await (await fetch("/auto/config")).json();
+        if (!cfg.cdp || !cfg.measurementTab) {
+          statusEl.textContent =
+            "This page is not open in the measurement browser, so the server cannot open/close tabs in it.\n" +
+            "Stop the server and run:  python server.py --launch-browser\n" +
+            "then use the page in the Chrome window that opens.";
+          return;
+        }
+      }
+      if (!(bufferMs >= 0)) { statusEl.textContent = "Buffer must be >= 0"; return; }
+
+      stopRequested = false;
+      const buttons = ["runBtn", "autoBtn"].map((id) => document.getElementById(id));
+      buttons.forEach((b) => (b.disabled = true));
+      document.getElementById("stopBtn").disabled = false;
+
+      let done = 0;
+      try {
+        for (let i = 1; i <= trials && !stopRequested; i++) {
+          const prefix = `[Trial ${i}/${trials}] `;
+          let trialIdPromise = null;
+          let currentTrialId = null;
+          let openError = null;
+
+          // Restore page-cache state, then let the system settle
+          if (cacheReset) {
+            statusEl.textContent = `${prefix}Resetting page cache...`;
+            const r = await postJSON("/auto/reset-cache");
+            if (!r.ok) throw new Error((await r.json()).error || "page-cache reset failed");
+          }
+          if (bufferMs > 0) {
+            statusEl.textContent = `${prefix}Settling for ${bufferMs / 1000}s...`;
+            await sleep(bufferMs);
+          }
+          if (stopRequested) break;
+
+          try {
+            await runAttack({
+              label,
+              sizeGB,
+              durationMs,
+              session,
+              onStatus: (msg) => { statusEl.textContent = prefix + msg; },
+              // Fired the instant recording starts; the server opens the
+              // link exactly openDelayMs later and closes it at durationMs.
+              onMeasureStart: url
+                ? () => {
+                    trialIdPromise = postJSON("/auto/trial-start", { url, openDelayMs, durationMs })
+                      .then((r) => r.json())
+                      .then((r) => {
+                        if (r.error) throw new Error(r.error);
+                        currentTrialId = r.trialId;
+                        return r.trialId;
+                      })
+                      .catch((e) => { openError = e; return null; });
+                  }
+                : null,
+              // The getter is read at upload time (after recording), so the
+              // server can attach its measured open/close times to this trace.
+              extra: {
+                trial: i,
+                trials,
+                url: url || null,
+                openDelayMs: url ? openDelayMs : null,
+                bufferMs,
+                cacheReset,
+                get autoTrialId() { return currentTrialId; },
+              },
+            });
+          } finally {
+            if (trialIdPromise) {
+              const id = await trialIdPromise;
+              if (id) await postJSON("/auto/trial-end", { trialId: id });
+            }
+          }
+          if (openError) throw new Error("Could not open link: " + openError.message);
+          done = i;
+        }
+        statusEl.textContent = stopRequested
+          ? `Stopped after ${done}/${trials} trials (label "${label}").`
+          : `Auto collection finished: ${done}/${trials} trials saved under label "${label}".`;
+      } catch (e) {
+        statusEl.textContent = `Error after ${done}/${trials} trials: ${e.message}`;
+        console.error(e);
+        await postJSON("/auto/stop");
+      } finally {
+        buttons.forEach((b) => (b.disabled = false));
+        document.getElementById("stopBtn").disabled = true;
       }
     });
   </script>
