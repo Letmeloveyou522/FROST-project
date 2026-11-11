@@ -94,6 +94,9 @@ self.onmessage = async (e) => {
     );
 
     self.postMessage({ type: "status", msg: `Measuring (${durationMs / 1000}s)...` });
+    // Tells the page the recording window starts now (used by auto mode to
+    // open the target link at a fixed offset from this moment).
+    self.postMessage({ type: "measuring" });
     const trace = measureTrace(accessHandle, durationMs, (n) =>
       self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
     );
