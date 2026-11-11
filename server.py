@@ -176,6 +176,11 @@ def _find_measurement_tab():
 # (server run from an Administrator terminal):
 #   set FROST_CACHE_CMD=C:\path\to\RAMMap64.exe -Et
 
+# COMMAND TO RUN THIS ON WINDOWS
+# C:\tools\RAMMap64.exe -accepteula
+# set FROST_CACHE_CMD=C:\tools\RAMMap64.exe -Et
+# .venv\Scripts\python server.py --launch-browser
+# 
 SUDO_HINT = (
     "Allow it without a password: "
     f"echo '{os.environ.get('USER', '<you>')} ALL=(root) NOPASSWD: /usr/sbin/purge' "
