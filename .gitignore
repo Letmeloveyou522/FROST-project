@@ -2,3 +2,4 @@
 __pycache__/
 traces*.jsonl
 **/.DS_Store
+.auto_profile/
