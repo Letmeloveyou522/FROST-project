@@ -7,8 +7,8 @@ Usage:
     python quick_check.py figma
 
 Input:
-    data/GPT.jsonl
-    data/figma.jsonl
+    data/GPT.jsonl or data/GPT/GPT.jsonl
+    data/figma.jsonl or data/figma/figma.jsonl
 
 Output:
     img/GPT.png
@@ -366,9 +366,18 @@ def main():
             print("Invalid label.")
             sys.exit(1)
 
-        files = [DATA_DIR / f"{label}.jsonl"]
+        files = [
+            p for p in (
+                DATA_DIR / f"{label}.jsonl",
+                DATA_DIR / label / f"{label}.jsonl",
+            )
+            if p.exists()
+        ]
+        if not files:
+            print(f"File not found: {DATA_DIR / label / (label + '.jsonl')}")
+            sys.exit(1)
     else:
-        files = sorted(DATA_DIR.glob("*.jsonl"))
+        files = sorted(DATA_DIR.glob("*.jsonl")) + sorted(DATA_DIR.glob("*/*.jsonl"))
 
     if not files:
         print("No JSONL files found in data/.")
