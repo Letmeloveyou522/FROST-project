@@ -42,6 +42,11 @@
     <input id="durationSec" type="number" value="10" />
   </label>
 
+  <label>
+    <input id="preload" type="checkbox" />
+    Preload the whole file into RAM before recording (RAM-only baseline; leave off for normal FROST traces)
+  </label>
+
   <button id="runBtn">Start Measurement</button>
 
   <h3 style="margin-top: 32px;">Auto collection</h3>
@@ -96,6 +101,7 @@
       const session = document.getElementById("session").value || "unsessioned";
       const sizeGB = parseFloat(document.getElementById("sizeGB").value);
       const durationMs = parseFloat(document.getElementById("durationSec").value) * 1000;
+      const preload = document.getElementById("preload").checked;
       const statusEl = document.getElementById("status");
 
       document.getElementById("runBtn").disabled = true;
@@ -104,6 +110,7 @@
           label,
           sizeGB,
           durationMs,
+          preload,
           session,
           onStatus: (msg) => { statusEl.textContent = msg; },
         });
@@ -145,6 +152,7 @@
       const session = document.getElementById("session").value || "unsessioned";
       const sizeGB = parseFloat(document.getElementById("sizeGB").value);
       const durationMs = parseFloat(document.getElementById("durationSec").value) * 1000;
+      const preload = document.getElementById("preload").checked;
       const url = document.getElementById("autoUrl").value.trim();
       const trials = parseInt(document.getElementById("autoTrials").value, 10);
       const openDelayMs = parseFloat(document.getElementById("autoOpenDelay").value) * 1000;
@@ -199,6 +207,7 @@
               label,
               sizeGB,
               durationMs,
+              preload,
               session,
               onStatus: (msg) => { statusEl.textContent = prefix + msg; },
               // Fired the instant recording starts; the server opens the

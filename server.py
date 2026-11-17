@@ -28,7 +28,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 META_FIELDS = [
     "session",
     "sizeGB",
+    "fileSizeBytes",  # real size of the measured file, verified by the worker
     "durationMs",
+    "preload",  # True: whole file was read into RAM right before recording
     "startedAt",
     "userAgent",
     # Auto-mode fields (None for manual runs)
@@ -63,6 +65,30 @@ def validate(data):
         for x in trace
     ):
         return "trace must contain only finite numbers"
+
+    # Optional (older clients don't send it): start time of each read in ms
+    # since recording began, one per trace sample, never going backwards.
+    times = data.get("times")
+    if times is not None:
+        if not isinstance(times, list) or len(times) != len(trace):
+            return "times must be a list with one entry per trace sample"
+        if not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            for x in times
+        ):
+            return "times must contain only finite numbers"
+        if any(b < a for a, b in zip(times, times[1:])):
+            return "times must be non-decreasing"
+
+    # The worker reports the real size of the file it measured. Reject a run
+    # whose file did not match the requested size.
+    size_gb = data.get("sizeGB")
+    file_size = data.get("fileSizeBytes")
+    if file_size is not None:
+        if not isinstance(file_size, int) or isinstance(file_size, bool) or file_size <= 0:
+            return "fileSizeBytes must be a positive integer"
+        if not isinstance(size_gb, (int, float)) or round(size_gb * 1024**3) != file_size:
+            return f"measured file was {file_size} bytes, which does not match sizeGB={size_gb}"
 
     return None
 
@@ -176,11 +202,12 @@ def _find_measurement_tab():
 # (server run from an Administrator terminal):
 #   set FROST_CACHE_CMD=C:\path\to\RAMMap64.exe -Et
 
-# COMMAND TO RUN THIS ON WINDOWS
+# COMMAND TO RUN THIS ON WINDOWS (in an admin console)
 # C:\tools\RAMMap64.exe -accepteula
 # set FROST_CACHE_CMD=C:\tools\RAMMap64.exe -Et
 # .venv\Scripts\python server.py --launch-browser
-# 
+
+
 SUDO_HINT = (
     "Allow it without a password: "
     f"echo '{os.environ.get('USER', '<you>')} ALL=(root) NOPASSWD: /usr/sbin/purge' "
@@ -377,7 +404,12 @@ def submit():
     if error:
         return jsonify({"error": error}), 400
 
-    record = {"label": data["label"], "trace": data["trace"], "ts": time.time()}
+    record = {
+        "label": data["label"],
+        "trace": data["trace"],
+        "times": data.get("times"),  # None for records from older clients
+        "ts": time.time(),
+    }
     for field in META_FIELDS:
         record[field] = data.get(field)
 
