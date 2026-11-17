@@ -162,7 +162,8 @@
 
       if (!(trials > 0)) { statusEl.textContent = "Number of trials must be at least 1"; return; }
       if (url) {
-        if (!/^https?:\/\//.test(url)) { statusEl.textContent = "Link must start with http:// or https://"; return; }
+        // about:blank is allowed as a control: a tab switch with no website I/O
+        if (!/^https?:\/\//.test(url) && url !== "about:blank") { statusEl.textContent = "Link must start with http:// or https://, or be about:blank"; return; }
         if (!(openDelayMs >= 0) || openDelayMs >= durationMs) {
           statusEl.textContent = "Open time must be >= 0 and shorter than the duration"; return;
         }

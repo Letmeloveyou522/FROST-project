@@ -66,6 +66,20 @@ def validate(data):
     ):
         return "trace must contain only finite numbers"
 
+    # Optional (older clients don't send it): start time of each read in ms
+    # since recording began, one per trace sample, never going backwards.
+    times = data.get("times")
+    if times is not None:
+        if not isinstance(times, list) or len(times) != len(trace):
+            return "times must be a list with one entry per trace sample"
+        if not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            for x in times
+        ):
+            return "times must contain only finite numbers"
+        if any(b < a for a, b in zip(times, times[1:])):
+            return "times must be non-decreasing"
+
     # The worker reports the real size of the file it measured. Reject a run
     # whose file did not match the requested size.
     size_gb = data.get("sizeGB")
@@ -134,7 +148,17 @@ def find_browser():
     return None
 
 
-def launch_browser():
+# Stop Chrome from deprioritising the measurement tab when the target site's
+# tab takes the foreground. Without these, every read slows ~1.8x at the
+# moment the tab opens, regardless of which site it is.
+NO_THROTTLE_FLAGS = [
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+]
+
+
+def launch_browser(no_throttle=False):
     """Start ONE long-lived Chrome with the DevTools endpoint and open the page."""
     browser = find_browser()
     if not browser:
@@ -147,12 +171,15 @@ def launch_browser():
             f"--remote-debugging-port={CDP_PORT}",
             "--no-first-run",
             "--no-default-browser-check",
+            *(NO_THROTTLE_FLAGS if no_throttle else []),
             f"http://localhost:{SERVER_PORT}/",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     print(f"[auto] launched measurement browser: {browser}")
+    if no_throttle:
+        print("[auto] background throttling disabled: " + " ".join(NO_THROTTLE_FLAGS))
 
 
 def _cdp(path, method="GET"):
@@ -236,6 +263,49 @@ def reset_page_cache():
 _trials = {}
 _trials_lock = threading.Lock()
 
+# TEMPORARY experiment: keep the measurement tab in the background for whole
+# trials, as in the paper's threat model (the victim browses while the
+# attacker's tab sits behind). A blank "cover" tab is brought to the front
+# when an auto run starts and again after each trial's site tab closes, so
+# the measurement tab is never the active tab while recording.
+# Set to False to restore the old behaviour (measurement tab in front).
+# Note: --no-throttle makes Chrome ignore background state, so run without it
+# for this experiment.
+KEEP_MEASUREMENT_IN_BACKGROUND = True
+# Page shown in the cover tab. It is opened once per auto run (before the
+# first trial) and stays loaded, so any activity it does in the background
+# shows up in every trial. "about:blank" is the quietest choice.
+COVER_TAB_URL = "https://www.google.com/"
+_cover_tab = None  # id of the cover tab; guarded by _trials_lock
+
+
+def _show_cover_tab():
+    """Bring the cover tab to the front, opening it if needed.
+
+    Caller must hold _trials_lock.
+    """
+    global _cover_tab
+    if _cover_tab:
+        try:
+            _cdp(f"/json/activate/{_cover_tab}")
+            return
+        except Exception:
+            _cover_tab = None  # closed by hand; open a new one
+    tab = _cdp("/json/new?" + quote(COVER_TAB_URL, safe=""), method="PUT")
+    _cover_tab = tab["id"]
+    _cdp(f"/json/activate/{_cover_tab}")
+
+
+def _close_cover_tab():
+    """Close the cover tab, if any. Caller must hold _trials_lock."""
+    global _cover_tab
+    if _cover_tab:
+        try:
+            _cdp(f"/json/close/{_cover_tab}")
+        except Exception:
+            pass
+        _cover_tab = None
+
 
 def _ms_since(t0):
     return round((time.perf_counter() - t0) * 1000, 1)
@@ -276,8 +346,14 @@ def _close_link(trial_id, remove=False):
             except Exception as e:
                 print(f"[auto] failed to close tab: {e}")
             trial["closedOffsetMs"] = _ms_since(trial["t0"])
+            if KEEP_MEASUREMENT_IN_BACKGROUND:
+                # Keep the measurement tab hidden for the next trial
+                try:
+                    _show_cover_tab()
+                except Exception as e:
+                    print(f"[auto] failed to show cover tab: {e}")
             # Bring the measurement tab back to the front
-            if trial["measurementTab"]:
+            elif trial["measurementTab"]:
                 try:
                     _cdp(f"/json/activate/{trial['measurementTab']}")
                 except Exception:
@@ -289,10 +365,20 @@ def _close_link(trial_id, remove=False):
 
 @app.route("/auto/config")
 def auto_config():
+    """Called once when an auto run starts."""
     try:
-        return jsonify({"cdp": True, "measurementTab": _find_measurement_tab() is not None})
+        found = _find_measurement_tab() is not None
     except Exception:
         return jsonify({"cdp": False, "measurementTab": False})
+    if found and KEEP_MEASUREMENT_IN_BACKGROUND:
+        # Hide the measurement tab before the first trial records anything
+        try:
+            with _trials_lock:
+                _show_cover_tab()
+            print(f"[auto] measurement tab moved to the background ({COVER_TAB_URL} in front)")
+        except Exception as e:
+            print(f"[auto] failed to show cover tab: {e}")
+    return jsonify({"cdp": True, "measurementTab": found})
 
 
 @app.route("/auto/reset-cache", methods=["POST"])
@@ -315,8 +401,12 @@ def auto_trial_start():
     open_delay_ms = data.get("openDelayMs", 0)
     duration_ms = data.get("durationMs")
 
-    if not isinstance(url, str) or not re.match(r"^https?://\S+$", url):
-        return jsonify({"error": "url must start with http:// or https://"}), 400
+    # about:blank is allowed as a control: it opens and focuses a tab like a
+    # real trial, but loads no website, so it isolates the tab-switch effect
+    if not isinstance(url, str) or not (
+        re.match(r"^https?://\S+$", url) or url == "about:blank"
+    ):
+        return jsonify({"error": "url must start with http:// or https://, or be about:blank"}), 400
     if not isinstance(open_delay_ms, (int, float)) or open_delay_ms < 0:
         return jsonify({"error": "openDelayMs must be >= 0"}), 400
     if not isinstance(duration_ms, (int, float)) or duration_ms <= 0:
@@ -366,6 +456,16 @@ def auto_stop():
         ids = list(_trials)
     for trial_id in ids:
         _close_link(trial_id, remove=True)
+    if KEEP_MEASUREMENT_IN_BACKGROUND:
+        # Run aborted: remove the cover so the page (and its error) is visible
+        with _trials_lock:
+            _close_cover_tab()
+        try:
+            mtab = _find_measurement_tab()
+            if mtab:
+                _cdp(f"/json/activate/{mtab}")
+        except Exception:
+            pass
     return jsonify({"status": "ok"})
 
 
@@ -390,7 +490,12 @@ def submit():
     if error:
         return jsonify({"error": error}), 400
 
-    record = {"label": data["label"], "trace": data["trace"], "ts": time.time()}
+    record = {
+        "label": data["label"],
+        "trace": data["trace"],
+        "times": data.get("times"),  # None for records from older clients
+        "ts": time.time(),
+    }
     for field in META_FIELDS:
         record[field] = data.get(field)
 
@@ -424,14 +529,22 @@ if __name__ == "__main__":
         action="store_true",
         help="start the measurement Chrome (with DevTools endpoint) and open the page",
     )
+    parser.add_argument(
+        "--no-throttle",
+        action="store_true",
+        help="with --launch-browser: stop Chrome from slowing the measurement tab "
+        "when another tab is in front",
+    )
     args = parser.parse_args()
+    if args.no_throttle and not args.launch_browser:
+        parser.error("--no-throttle only works together with --launch-browser")
 
     print(f"Server running at http://localhost:{SERVER_PORT}")
     print(f"Trace directory: {DATA_DIR}")
 
     if args.launch_browser:
         # Give Flask a moment to start before Chrome loads the page
-        threading.Timer(1.0, launch_browser).start()
+        threading.Timer(1.0, launch_browser, kwargs={"no_throttle": args.no_throttle}).start()
 
     app.run(
         port=SERVER_PORT,
