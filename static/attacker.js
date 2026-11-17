@@ -40,6 +40,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
             body: JSON.stringify({
               label: msg.label,
               trace: msg.trace,
+              times: msg.times,
               sizeGB: msg.sizeGB,
               fileSizeBytes: msg.fileSizeBytes,
               durationMs: msg.durationMs,

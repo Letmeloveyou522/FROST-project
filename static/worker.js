@@ -116,8 +116,12 @@ function preloadFile(accessHandle, onProgress) {
   return performance.now() - t0;
 }
 
+// Returns { trace, times }: trace[i] is the latency of read i, times[i] is
+// when read i started, in ms since recording began. The sample rate varies
+// (slow reads take longer), so the sample index is not a reliable clock.
 function measureTrace(accessHandle, durationMs, onTick) {
   const trace = [];
+  const times = [];
   const fileSize = accessHandle.getSize();
   const maxOffset = fileSize - READ_SIZE;
   const buf = new Uint8Array(READ_SIZE);
@@ -129,9 +133,10 @@ function measureTrace(accessHandle, durationMs, onTick) {
     accessHandle.read(buf, { at: offset });
     const t1 = performance.now();
     trace.push(+(t1 - t0).toFixed(4));
+    times.push(+(t0 - start).toFixed(3));
     if (onTick && trace.length % 200 === 0) onTick(trace.length);
   }
-  return trace;
+  return { trace, times };
 }
 
 self.onmessage = async (e) => {
@@ -166,14 +171,14 @@ self.onmessage = async (e) => {
     // Tells the page the recording window starts now (used by auto mode to
     // open the target link at a fixed offset from this moment).
     self.postMessage({ type: "measuring" });
-    const trace = measureTrace(accessHandle, durationMs, (n) =>
+    const { trace, times } = measureTrace(accessHandle, durationMs, (n) =>
       self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
     );
     accessHandle.close();
     accessHandle = null;
 
     // [수정] 측정 조건(sizeGB, durationMs)을 메인 스레드로 다시 돌려보낸다. 서버 저장에 쓰인다.
-    self.postMessage({ type: "done", label, trace, sizeGB, fileSizeBytes, durationMs, preload: !!preload });
+    self.postMessage({ type: "done", label, trace, times, sizeGB, fileSizeBytes, durationMs, preload: !!preload });
   } catch (err) {
     // [수정] 에러 시에도 핸들을 닫아서, 다음 측정에서 파일이 잠겨 있는 문제를 막는다.
     if (accessHandle) accessHandle.close();
