@@ -41,7 +41,8 @@ IMG_DIR = BASE_DIR / "img"
 
 SPIKE_THRESHOLD_MS = 1.0
 SPIKE_HALF_WINDOW = 50
-SMOOTH_WINDOW = 500
+SMOOTH_WINDOW_MS = 100   # moving-average window for the time plot
+TIME_BIN_MS = 1.0        # resolution of the common time grid
 
 # None: analyze every file size separately
 # 64: analyze only records with sizeGB=64
@@ -84,6 +85,36 @@ def moving_average(arr, window):
 
     kernel = np.ones(window) / window
     return np.convolve(arr, kernel, mode="valid")
+
+
+def trace_to_time_grid(raw, values, total_ms):
+    """Bin a trace onto a common time grid.
+
+    Samples are back-to-back reads, so each sample's elapsed time is the
+    cumulative sum of the raw latencies before it (spikes included, since
+    they did take that long). Returns the mean of `values` (e.g. the
+    spike-filtered trace)
+    per TIME_BIN_MS bin over [0, total_ms); empty bins are interpolated.
+    """
+    raw = np.asarray(raw, dtype=float)
+    arr = np.asarray(values, dtype=float)
+    t = np.cumsum(raw) - raw  # start time of each read (ms)
+
+    n_bins = int(total_ms // TIME_BIN_MS)
+    edges = np.arange(n_bins + 1) * TIME_BIN_MS
+
+    sums, _ = np.histogram(t, bins=edges, weights=arr)
+    counts, _ = np.histogram(t, bins=edges)
+
+    out = np.full(n_bins, np.nan)
+    has = counts > 0
+    out[has] = sums[has] / counts[has]
+
+    if not np.all(has) and np.any(has):
+        idx = np.arange(n_bins)
+        out[~has] = np.interp(idx[~has], idx[has], out[has])
+
+    return out
 
 
 def normalize_size(value):
@@ -206,9 +237,8 @@ def analyze_file(file_path):
         print("-" * 62)
 
         for t in records:
-            raw = t["trace"][:min_len]
-
-            filtered, n_spikes = filter_spikes(raw)
+            filtered_full, _ = filter_spikes(t["trace"])
+            filtered, n_spikes = filter_spikes(t["trace"][:min_len])
 
             median = float(np.median(filtered))
             p95 = float(np.percentile(filtered, 95))
@@ -226,6 +256,9 @@ def analyze_file(file_path):
 
             by_label[label].append({
                 "filtered": filtered,
+                "raw_full": t["trace"],
+                "filtered_full": filtered_full,
+                "open_ms": t.get("openedOffsetMs"),
                 "median": median,
                 "p95": p95,
                 "spikes": n_spikes,
@@ -275,21 +308,42 @@ def analyze_file(file_path):
             2, 1, figsize=(11, 8)
         )
 
+        # Common time span: the shortest trace's total elapsed time
+        total_ms = min(
+            float(np.sum(r["raw_full"]))
+            for runs in by_label.values()
+            for r in runs
+        )
+        smooth_bins = max(1, int(SMOOTH_WINDOW_MS / TIME_BIN_MS))
+
         for label in labels:
             runs = by_label[label]
             color = label_colors[label]
 
             mean_curve = np.mean(
-                [r["filtered"] for r in runs],
+                [
+                    trace_to_time_grid(
+                        r["raw_full"], r["filtered_full"], total_ms
+                    )
+                    for r in runs
+                ],
                 axis=0
             )
 
             smoothed = moving_average(
                 mean_curve,
-                SMOOTH_WINDOW
+                smooth_bins
+            )
+
+            # Centre each smoothed point on its window, in seconds
+            offset = (len(mean_curve) - len(smoothed)) / 2
+            times_s = (
+                (np.arange(len(smoothed)) + offset + 0.5)
+                * TIME_BIN_MS / 1000
             )
 
             ax_trace.plot(
+                times_s,
                 smoothed,
                 color=color,
                 label=f"{label} ({len(runs)} runs)",
@@ -313,7 +367,22 @@ def analyze_file(file_path):
         ax_trace.set_title(
             f"Mean read latency over time (sizeGB={size})"
         )
-        ax_trace.set_xlabel("Sample index")
+        open_times = [
+            r["open_ms"]
+            for runs in by_label.values()
+            for r in runs
+            if isinstance(r["open_ms"], (int, float))
+        ]
+        if open_times:
+            ax_trace.axvline(
+                np.mean(open_times) / 1000,
+                color="gray",
+                linestyle="--",
+                linewidth=1,
+                label="page opened"
+            )
+
+        ax_trace.set_xlabel("Time (s)")
         ax_trace.set_ylabel("Read latency (ms)")
         ax_trace.legend()
         ax_trace.grid(alpha=0.3)
