@@ -31,43 +31,99 @@ function fillPseudoRandom(buffer, seed) {
   return x;
 }
 
+const BYTES_PER_GB = 1024 * 1024 * 1024;
+
+// Makes bigfile.bin EXACTLY sizeGB long. A file left over from an earlier run
+// with a different size is never reused as-is: a larger file is truncated
+// down, a smaller one is extended. Without this, asking for 4 GB after a 30 GB
+// run silently measured the old 30 GB file.
 async function createLargeFile(sizeGB, onProgress) {
   const root = await navigator.storage.getDirectory();
   const handle = await root.getFileHandle(FILE_NAME, { create: true });
   const accessHandle = await handle.createSyncAccessHandle();
 
-  const targetSize = sizeGB * 1024 * 1024 * 1024;
-  const existingSize = accessHandle.getSize();
+  try {
+    const targetSize = Math.round(sizeGB * BYTES_PER_GB);
+    const existingSize = accessHandle.getSize();
 
-  // [주석 추가] 파일은 앞에서부터 순서대로 쓰이므로, 크기가 목표에 도달했다면
-  // 쓰기가 끝까지 완료된 것이다. 중간에 끊긴 파일은 크기가 작아서 여기서 걸러지고 다시 쓰인다.
-  if (existingSize >= targetSize) {
-    return accessHandle; // already big enough, reuse as-is
+    if (existingSize > targetSize) {
+      // Too big: cut it down. The remaining prefix is already fully written.
+      accessHandle.truncate(targetSize);
+    } else if (existingSize < targetSize) {
+      // Too small (new file, smaller earlier run, or an interrupted write).
+      // The file is always written front to back, so everything before the
+      // last full chunk is valid; resume from there instead of starting over.
+      const startChunk = Math.floor(existingSize / CHUNK_SIZE);
+      const totalChunks = Math.ceil(targetSize / CHUNK_SIZE);
+      const buffer = new Uint8Array(CHUNK_SIZE);
+      let seed = Date.now() & 0xffffffff;
+
+      for (let i = startChunk; i < totalChunks; i++) {
+        const at = i * CHUNK_SIZE;
+        const len = Math.min(CHUNK_SIZE, targetSize - at);
+        seed = fillPseudoRandom(buffer, seed ^ i);
+        const written = accessHandle.write(buffer.subarray(0, len), { at });
+        if (written !== len) {
+          throw new Error(`Short write at ${at}: wrote ${written} of ${len} bytes (disk full?)`);
+        }
+        if (onProgress && (i - startChunk) % 100 === 0) {
+          onProgress((i - startChunk) / (totalChunks - startChunk));
+        }
+      }
+    }
+    accessHandle.flush();
+
+    verifyFile(accessHandle, targetSize);
+    return accessHandle;
+  } catch (err) {
+    accessHandle.close();
+    throw err;
   }
+}
 
-  const totalChunks = Math.ceil(targetSize / CHUNK_SIZE);
-  const buffer = new Uint8Array(CHUNK_SIZE);
-  let seed = Date.now() & 0xffffffff;
-
-  for (let i = 0; i < totalChunks; i++) {
-    seed = fillPseudoRandom(buffer, seed ^ i);
-    accessHandle.write(buffer, { at: i * CHUNK_SIZE });
-    if (onProgress && i % 100 === 0) {
-      onProgress(i / totalChunks);
+// Refuses to measure unless the file is exactly the requested size and its
+// first and last blocks are actually readable.
+function verifyFile(accessHandle, targetSize) {
+  const actualSize = accessHandle.getSize();
+  if (actualSize !== targetSize) {
+    throw new Error(
+      `File size check failed: expected ${targetSize} bytes, got ${actualSize}`
+    );
+  }
+  if (actualSize < READ_SIZE * 2) {
+    throw new Error(`File is too small to measure (${actualSize} bytes)`);
+  }
+  const buf = new Uint8Array(READ_SIZE);
+  for (const at of [0, actualSize - READ_SIZE]) {
+    const n = accessHandle.read(buf, { at });
+    if (n !== READ_SIZE) {
+      throw new Error(`File read check failed at offset ${at}: read ${n} of ${READ_SIZE} bytes`);
     }
   }
-  accessHandle.flush();
-  return accessHandle;
+}
+
+// Reads the whole file front to back so the OS caches it in RAM. In auto mode
+// this runs after the page-cache reset and buffer, right before recording.
+const PRELOAD_CHUNK = 8 * 1024 * 1024;
+function preloadFile(accessHandle, onProgress) {
+  const size = accessHandle.getSize();
+  const buf = new Uint8Array(PRELOAD_CHUNK);
+  const t0 = performance.now();
+  for (let at = 0; at < size; at += PRELOAD_CHUNK) {
+    accessHandle.read(buf, { at });
+    if (onProgress && (at / PRELOAD_CHUNK) % 64 === 0) onProgress(at / size);
+  }
+  return performance.now() - t0;
 }
 
 function measureTrace(accessHandle, durationMs, onTick) {
   const trace = [];
   const fileSize = accessHandle.getSize();
+  const maxOffset = fileSize - READ_SIZE;
   const buf = new Uint8Array(READ_SIZE);
   const start = performance.now();
 
   while (performance.now() - start < durationMs) {
-    const maxOffset = fileSize - READ_SIZE;
     const offset = Math.floor(Math.random() * maxOffset);
     const t0 = performance.now();
     accessHandle.read(buf, { at: offset });
@@ -79,7 +135,7 @@ function measureTrace(accessHandle, durationMs, onTick) {
 }
 
 self.onmessage = async (e) => {
-  const { label, sizeGB, durationMs } = e.data;
+  const { label, sizeGB, durationMs, preload } = e.data;
   // [수정] 에러가 나도 핸들을 닫을 수 있도록 밖으로 뺐다.
   let accessHandle = null;
   try {
@@ -93,7 +149,20 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "status", msg: `Filling file: ${(p * 100).toFixed(0)}%` })
     );
 
-    self.postMessage({ type: "status", msg: `Measuring (${durationMs / 1000}s)...` });
+    if (preload) {
+      const ms = preloadFile(accessHandle, (p) =>
+        self.postMessage({ type: "status", msg: `Preloading file into RAM: ${(p * 100).toFixed(0)}%` })
+      );
+      const mbps = accessHandle.getSize() / (1024 * 1024) / (ms / 1000);
+      self.postMessage({ type: "status", msg: `Preloaded in ${(ms / 1000).toFixed(1)}s (${mbps.toFixed(0)} MB/s)` });
+    }
+
+    // Recorded with the trace so every saved run states the size it really used.
+    const fileSizeBytes = accessHandle.getSize();
+    self.postMessage({
+      type: "status",
+      msg: `Verified ${(fileSizeBytes / BYTES_PER_GB).toFixed(2)} GB file. Measuring (${durationMs / 1000}s)...`,
+    });
     // Tells the page the recording window starts now (used by auto mode to
     // open the target link at a fixed offset from this moment).
     self.postMessage({ type: "measuring" });
@@ -104,7 +173,7 @@ self.onmessage = async (e) => {
     accessHandle = null;
 
     // [수정] 측정 조건(sizeGB, durationMs)을 메인 스레드로 다시 돌려보낸다. 서버 저장에 쓰인다.
-    self.postMessage({ type: "done", label, trace, sizeGB, durationMs });
+    self.postMessage({ type: "done", label, trace, sizeGB, fileSizeBytes, durationMs, preload: !!preload });
   } catch (err) {
     // [수정] 에러 시에도 핸들을 닫아서, 다음 측정에서 파일이 잠겨 있는 문제를 막는다.
     if (accessHandle) accessHandle.close();
