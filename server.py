@@ -66,6 +66,20 @@ def validate(data):
     ):
         return "trace must contain only finite numbers"
 
+    # Optional (older clients don't send it): start time of each read in ms
+    # since recording began, one per trace sample, never going backwards.
+    times = data.get("times")
+    if times is not None:
+        if not isinstance(times, list) or len(times) != len(trace):
+            return "times must be a list with one entry per trace sample"
+        if not all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            for x in times
+        ):
+            return "times must contain only finite numbers"
+        if any(b < a for a, b in zip(times, times[1:])):
+            return "times must be non-decreasing"
+
     # The worker reports the real size of the file it measured. Reject a run
     # whose file did not match the requested size.
     size_gb = data.get("sizeGB")
@@ -390,7 +404,12 @@ def submit():
     if error:
         return jsonify({"error": error}), 400
 
-    record = {"label": data["label"], "trace": data["trace"], "ts": time.time()}
+    record = {
+        "label": data["label"],
+        "trace": data["trace"],
+        "times": data.get("times"),  # None for records from older clients
+        "ts": time.time(),
+    }
     for field in META_FIELDS:
         record[field] = data.get(field)
 
