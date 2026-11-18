@@ -3,8 +3,8 @@
 
 Usage:
     python quick_check.py
-    python quick_check.py GPT
     python quick_check.py figma
+    python quick_check.py --overlay
 
 Input:
     data/GPT.jsonl or data/GPT/GPT.jsonl
@@ -13,6 +13,7 @@ Input:
 Output:
     img/GPT.png
     img/figma.png
+    img/all_sites.png   (--overlay, every label on one time axis)
 
 Original JSONL files are never modified.
 """
@@ -46,6 +47,12 @@ SMOOTH_WINDOW = 500
 # None: analyze every file size separately
 # 64: analyze only records with sizeGB=64
 ANALYSIS_SIZE_GB = None
+
+# Combined overlay: one point every 10 ms, then a 0.3 s centered smooth.
+OVERLAY_DT_S = 0.01
+OVERLAY_SMOOTH_S = 0.30
+LABEL_ORDER = ["gpt", "navermap", "coupang", "figma", "google", "idle", "instagram", "youtube"]
+DISPLAY_NAMES = {"gpt": "GPT", "navermap": "Navermap"}
 
 
 # =========================
@@ -345,6 +352,142 @@ def analyze_file(file_path):
         print(f"\nSaved {output_path}")
 
 
+def display_name(label):
+    return DISPLAY_NAMES.get(label, label)
+
+
+def trace_on_time_grid(trace, duration_ms, grid_s):
+    """Spike-filtered latency resampled onto wall-clock seconds.
+
+    Sample times are the cumulative read latencies. When durationMs is
+    known, that clock is stretched onto the real measurement window so
+    index position is not mistaken for time.
+    """
+    values, _ = filter_spikes(trace)
+    dt = np.asarray(trace, dtype=float)
+    dt = np.where(np.isfinite(dt) & (dt > 0), dt, 1e-4)
+    times_ms = np.cumsum(dt)
+    if duration_ms and times_ms[-1] > 0:
+        times_ms *= float(duration_ms) / times_ms[-1]
+    times_s = times_ms / 1000.0
+    sampled = np.interp(grid_s, times_s, values, left=np.nan, right=np.nan)
+    return sampled
+
+
+def smooth_centered(values, window):
+    window = max(1, int(window))
+    if window % 2 == 0:
+        window += 1
+    if window <= 1:
+        return values
+    kernel = np.ones(window) / window
+    mask = np.isfinite(values).astype(float)
+    filled = np.where(np.isfinite(values), values, 0.0)
+    numer = np.convolve(filled, kernel, mode="same")
+    denom = np.convolve(mask, kernel, mode="same")
+    out = numer / np.maximum(denom, 1e-9)
+    out[denom < 0.5] = np.nan
+    return out
+
+
+def plot_overlay(files):
+    """One figure, every website, with time in seconds and the open mark."""
+    grouped = defaultdict(list)
+    open_delays = []
+
+    for file_path in files:
+        for record in load_traces(file_path):
+            grouped[record["_label"]].append(record)
+            delay = record.get("openDelayMs")
+            if isinstance(delay, (int, float)) and delay >= 0:
+                open_delays.append(float(delay) / 1000.0)
+
+    if not grouped:
+        print("No traces to overlay.")
+        return
+
+    sizes = [
+        record.get("sizeGB")
+        for records in grouped.values()
+        for record in records
+        if isinstance(record.get("sizeGB"), (int, float))
+    ]
+    size_title = float(np.median(sizes)) if sizes else "unknown"
+
+    duration_s = 10.0
+    known_durations = [
+        record.get("durationMs")
+        for records in grouped.values()
+        for record in records
+        if isinstance(record.get("durationMs"), (int, float)) and record["durationMs"] > 0
+    ]
+    if known_durations:
+        duration_s = float(np.median(known_durations)) / 1000.0
+
+    grid = np.arange(0.0, duration_s, OVERLAY_DT_S)
+    open_s = float(np.median(open_delays)) if open_delays else 2.0
+    smooth_n = max(1, round(OVERLAY_SMOOTH_S / OVERLAY_DT_S))
+
+    labels = [name for name in LABEL_ORDER if name in grouped]
+    labels += sorted(name for name in grouped if name not in labels)
+
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    fig, (ax_trace, ax_hist) = plt.subplots(2, 1, figsize=(11, 8))
+    colors = plt.get_cmap("tab10")
+
+    for i, label in enumerate(labels):
+        records = grouped[label]
+        curves = [
+            trace_on_time_grid(record["trace"], record.get("durationMs"), grid)
+            for record in records
+        ]
+        mean_curve = np.nanmean(curves, axis=0)
+        smoothed = smooth_centered(mean_curve, smooth_n)
+        color = colors(i % 10)
+        name = f"{display_name(label)} ({len(records)} runs)"
+        ax_trace.plot(grid, smoothed, color=color, label=name, linewidth=1.5)
+
+        filtered = np.concatenate([filter_spikes(record["trace"])[0] for record in records])
+        ax_hist.hist(
+            filtered,
+            bins=np.linspace(0, 0.3, 61),
+            density=True,
+            histtype="step",
+            color=color,
+            linewidth=1.5,
+            label=name,
+        )
+
+    ax_trace.axvline(open_s, color="0.35", linestyle="--", linewidth=1)
+    ax_trace.text(
+        open_s,
+        0.98,
+        "site opened",
+        transform=ax_trace.get_xaxis_transform(),
+        ha="left",
+        va="top",
+        fontsize=9,
+    )
+    ax_trace.set_xlim(0, duration_s)
+    ax_trace.set_title(f"Mean read latency over time (sizeGB={size_title})")
+    ax_trace.set_xlabel("Time (s)")
+    ax_trace.set_ylabel("Read latency (ms)")
+    ax_trace.legend(fontsize=8, loc="upper left")
+    ax_trace.grid(alpha=0.3)
+
+    ax_hist.set_title("Latency distribution (0-0.3ms)")
+    ax_hist.set_xlabel("Read latency (ms)")
+    ax_hist.set_ylabel("Probability density")
+    ax_hist.legend(fontsize=8)
+    ax_hist.grid(alpha=0.3)
+
+    plt.tight_layout()
+    output_path = IMG_DIR / "all_sites.png"
+    plt.savefig(output_path, dpi=150)
+    plt.close(fig)
+    print(f"\nSaved {output_path}")
+
+
 # =========================
 # Main
 # =========================
@@ -354,12 +497,14 @@ def main():
         print("data/ directory not found.")
         sys.exit(1)
 
-    # Optional website label
+    # Optional website label, or one combined figure
     if len(sys.argv) > 2:
-        print("Usage: python quick_check.py [label]")
+        print("Usage: python quick_check.py [label|--overlay]")
         sys.exit(1)
 
-    if len(sys.argv) == 2:
+    overlay_only = len(sys.argv) == 2 and sys.argv[1] == "--overlay"
+
+    if len(sys.argv) == 2 and not overlay_only:
         label = sys.argv[1]
 
         if not re.fullmatch(r"[A-Za-z0-9_-]+", label):
@@ -383,12 +528,19 @@ def main():
         print("No JSONL files found in data/.")
         sys.exit(1)
 
+    if overlay_only:
+        plot_overlay(files)
+        return
+
     for file_path in files:
         if not file_path.exists():
             print(f"File not found: {file_path}")
             continue
 
         analyze_file(file_path)
+
+    if len(files) > 1:
+        plot_overlay(files)
 
     print("\nAll analyses completed!")
 
