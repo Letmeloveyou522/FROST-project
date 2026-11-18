@@ -275,7 +275,7 @@ KEEP_MEASUREMENT_IN_BACKGROUND = True
 # Page shown in the cover tab. It is opened once per auto run (before the
 # first trial) and stays loaded, so any activity it does in the background
 # shows up in every trial. "about:blank" is the quietest choice.
-COVER_TAB_URL = "https://www.google.com/"
+COVER_TAB_URL = "about:blank"
 _cover_tab = None  # id of the cover tab; guarded by _trials_lock
 
 
