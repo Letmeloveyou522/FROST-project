@@ -167,14 +167,17 @@
         if (!(openDelayMs >= 0) || openDelayMs >= durationMs) {
           statusEl.textContent = "Open time must be >= 0 and shorter than the duration"; return;
         }
-        const cfg = await (await fetch("/auto/config")).json();
-        if (!cfg.cdp || !cfg.measurementTab) {
-          statusEl.textContent =
-            "This page is not open in the measurement browser, so the server cannot open/close tabs in it.\n" +
-            "Stop the server and run:  python server.py --launch-browser\n" +
-            "then use the page in the Chrome window that opens.";
-          return;
-        }
+      }
+      // Always called, even for idle runs: when the server keeps the
+      // measurement tab in the background, this opens the blank cover tab in
+      // front, so idle traces are recorded under the same conditions.
+      const cfg = await (await fetch("/auto/config")).json();
+      if ((url || cfg.keepInBackground) && (!cfg.cdp || !cfg.measurementTab)) {
+        statusEl.textContent =
+          "This page is not open in the measurement browser, so the server cannot open/close tabs in it.\n" +
+          "Stop the server and run:  python server.py --launch-browser\n" +
+          "then use the page in the Chrome window that opens.";
+        return;
       }
       if (!(bufferMs >= 0)) { statusEl.textContent = "Buffer must be >= 0"; return; }
 

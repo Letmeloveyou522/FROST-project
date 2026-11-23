@@ -365,11 +365,13 @@ def _close_link(trial_id, remove=False):
 
 @app.route("/auto/config")
 def auto_config():
-    """Called once when an auto run starts."""
+    """Called once when an auto run starts, including idle runs (no link), so
+    the cover tab is in front for those too."""
     try:
         found = _find_measurement_tab() is not None
     except Exception:
-        return jsonify({"cdp": False, "measurementTab": False})
+        return jsonify({"cdp": False, "measurementTab": False,
+                        "keepInBackground": KEEP_MEASUREMENT_IN_BACKGROUND})
     if found and KEEP_MEASUREMENT_IN_BACKGROUND:
         # Hide the measurement tab before the first trial records anything
         try:
@@ -378,7 +380,8 @@ def auto_config():
             print(f"[auto] measurement tab moved to the background ({COVER_TAB_URL} in front)")
         except Exception as e:
             print(f"[auto] failed to show cover tab: {e}")
-    return jsonify({"cdp": True, "measurementTab": found})
+    return jsonify({"cdp": True, "measurementTab": found,
+                    "keepInBackground": KEEP_MEASUREMENT_IN_BACKGROUND})
 
 
 @app.route("/auto/reset-cache", methods=["POST"])
