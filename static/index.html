@@ -88,6 +88,71 @@
   <button id="autoBtn">Start Auto Collection</button>
   <button id="stopBtn" disabled>Stop</button>
 
+  <h3 style="margin-top: 32px;">Long recording with visit log</h3>
+  <p style="font-size: 13px; color: #555;">
+    Records one trace until you press Stop (uses the session/size above). The
+    server logs the exact moment each page starts loading, plus every tab opened
+    or closed, and saves them with the trace, so the notebook can check the
+    model's detected visits.
+    <br><br>
+    <b>Browse by hand</b> (box below unticked): once the status says RECORDING,
+    open sites in new tabs or the address bar of this Chrome window. Leave at
+    least 2 s of quiet before each visit and 10 s between visits, and keep
+    recording 8 s after the last one. Turn off Settings &rarr; Performance &rarr;
+    Preload pages, or Chrome may start loading a page while you are still typing.
+    <br><br>
+    <b>Server opens the sites</b> (box ticked): hands off. The server waits a random
+    quiet time, opens the next site in a new tab like auto mode, closes it again,
+    and repeats until you press Stop. With the cache reset ticked, it also resets
+    the OS page cache before recording and after every visit, then lets the system
+    settle, like auto mode before each trial. These are the same kind of visits the
+    models were trained on.
+    <br><br>
+    Either way, this page must be open in the browser started by
+    <code>python server.py --launch-browser</code>.
+  </p>
+
+  <label>
+    <input id="longServerOpens" type="checkbox" style="width: auto;" />
+    Server opens the sites below (one per line, each opened once per round in random order)
+  </label>
+  <textarea id="longUrls" rows="7" style="width: 100%; box-sizing: border-box; font-size: 13px;">https://chatgpt.com/
+https://www.coupang.com/
+https://www.figma.com/
+https://www.google.com/
+https://www.instagram.com/
+https://map.naver.com/p/
+https://www.youtube.com/</textarea>
+
+  <label>
+    Quiet time before each site opens, random between (seconds)
+    <input id="longQuietMin" type="number" value="4" min="2" step="0.5" /> and
+    <input id="longQuietMax" type="number" value="12" min="2" step="0.5" />
+  </label>
+
+  <label>
+    Keep each site open for (seconds; training trials closed it after 8)
+    <input id="longOpenS" type="number" value="8" min="1" step="0.5" />
+  </label>
+
+  <label>
+    <input id="longCacheReset" type="checkbox" style="width: auto;" />
+    Reset OS page cache before recording and after each visit (like auto mode; server-opened sites only)
+  </label>
+
+  <label>
+    Settle after each cache reset, before the quiet time (seconds)
+    <input id="longSettleS" type="number" value="5" min="0" step="0.5" />
+  </label>
+
+  <label>
+    Save under label (data/&lt;label&gt;.jsonl; keep it out of the training labels)
+    <input id="longLabel" type="text" value="test" style="width: 200px;" />
+  </label>
+
+  <button id="longStartBtn">Start Long Recording</button>
+  <button id="longStopBtn" disabled>Stop &amp; Save</button>
+
   <div id="status">Waiting...</div>
 
   <script src="/attacker.js"></script>
@@ -255,6 +320,89 @@
       } finally {
         buttons.forEach((b) => (b.disabled = false));
         document.getElementById("stopBtn").disabled = true;
+      }
+    });
+
+    // ---------------- Long recording with visit log ----------------
+    // The worker's read loop never yields, so Stop reaches it through shared
+    // memory instead of a message (needs COOP/COEP, which the server sets).
+    let longStopFlag = null;
+    let currentLongId = null;
+
+    document.getElementById("longStopBtn").addEventListener("click", () => {
+      if (longStopFlag) Atomics.store(longStopFlag, 0, 1);
+      // no more server site opens / cache resets while the trace uploads
+      if (currentLongId) postJSON("/long/stop-opening", { longId: currentLongId });
+      document.getElementById("longStopBtn").disabled = true;
+    });
+
+    document.getElementById("longStartBtn").addEventListener("click", async () => {
+      const label = document.getElementById("longLabel").value.trim() || "test";
+      const session = document.getElementById("session").value || "unsessioned";
+      const sizeGB = parseFloat(document.getElementById("sizeGB").value);
+      const preload = document.getElementById("preload").checked;
+      const statusEl = document.getElementById("status");
+
+      if (!crossOriginIsolated) {
+        statusEl.textContent = "This page is not cross-origin isolated, so Stop cannot reach the recorder. Open it from the server.";
+        return;
+      }
+      const serverOpens = document.getElementById("longServerOpens").checked;
+      const opts = serverOpens
+        ? {
+            urls: document.getElementById("longUrls").value.split("\n").map((u) => u.trim()).filter(Boolean),
+            quietS: [parseFloat(document.getElementById("longQuietMin").value),
+                     parseFloat(document.getElementById("longQuietMax").value)],
+            openS: parseFloat(document.getElementById("longOpenS").value),
+            cacheReset: document.getElementById("longCacheReset").checked,
+            settleS: parseFloat(document.getElementById("longSettleS").value),
+          }
+        : {};
+      if (serverOpens && opts.urls.length === 0) { statusEl.textContent = "List at least one site, or untick the box"; return; }
+      if (serverOpens && opts.cacheReset) statusEl.textContent = "Resetting page cache...";
+      const start = await postJSON("/long/start", opts);
+      const started = await start.json();
+      if (!start.ok) { statusEl.textContent = "Error: " + started.error; return; }
+      const longId = started.longId;
+      currentLongId = longId;
+
+      longStopFlag = new Int32Array(new SharedArrayBuffer(4));
+      const buttons = ["runBtn", "autoBtn", "longStartBtn"].map((id) => document.getElementById(id));
+      buttons.forEach((b) => (b.disabled = true));
+      document.getElementById("longStopBtn").disabled = false;
+
+      let recording = false;
+      try {
+        const result = await runAttack({
+          label,
+          sizeGB,
+          durationMs: Infinity,
+          preload,
+          session,
+          stopFlag: longStopFlag,
+          onMeasureStart: () => {
+            recording = true;
+            if (serverOpens) postJSON("/long/measuring", { longId });  // server starts opening sites
+          },
+          onStatus: (msg) => {
+            statusEl.textContent = (recording && longStopFlag && !Atomics.load(longStopFlag, 0)
+              ? (serverOpens ? "RECORDING: the server is opening sites; hands off. Press Stop & Save when done.\n"
+                             : "RECORDING: browse now, press Stop & Save when done.\n") : "") + msg;
+          },
+          extra: { longId },
+        });
+        const visits = result.visits || [];
+        statusEl.textContent += `\n${visits.length} visit(s) logged, ${result.events || 0} tab event(s):` +
+          visits.map((v) => `\n  ${(v.t / 1000).toFixed(2)} s  ${v.url}  (${v.by})`).join("");
+      } catch (e) {
+        statusEl.textContent = "Error: " + e.message;
+        console.error(e);
+        await postJSON("/long/abort", { longId });
+      } finally {
+        longStopFlag = null;
+        currentLongId = null;
+        buttons.forEach((b) => (b.disabled = false));
+        document.getElementById("longStopBtn").disabled = true;
       }
     });
   </script>

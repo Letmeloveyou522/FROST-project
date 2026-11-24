@@ -117,30 +117,32 @@ function preloadFile(accessHandle, onProgress) {
 }
 
 // Returns { trace, times }: trace[i] is the latency of read i, times[i] is
-// when read i started, in ms since recording began. The sample rate varies
-// (slow reads take longer), so the sample index is not a reliable clock.
-function measureTrace(accessHandle, durationMs, onTick) {
+// when read i started, in ms since recording began (`start`). The sample rate
+// varies (slow reads take longer), so the sample index is not a reliable clock.
+// Stops after durationMs, or as soon as the page sets stop[0] to 1 (long
+// recordings: this loop never yields, so a message could not stop it).
+function measureTrace(accessHandle, durationMs, start, stop, onTick) {
   const trace = [];
   const times = [];
   const fileSize = accessHandle.getSize();
   const maxOffset = fileSize - READ_SIZE;
   const buf = new Uint8Array(READ_SIZE);
-  const start = performance.now();
 
-  while (performance.now() - start < durationMs) {
+  while (performance.now() - start < durationMs && !(stop && Atomics.load(stop, 0))) {
     const offset = Math.floor(Math.random() * maxOffset);
     const t0 = performance.now();
     accessHandle.read(buf, { at: offset });
     const t1 = performance.now();
     trace.push(+(t1 - t0).toFixed(4));
     times.push(+(t0 - start).toFixed(3));
-    if (onTick && trace.length % 200 === 0) onTick(trace.length);
+    if (onTick && trace.length % 200 === 0) onTick(trace.length, t1 - start);
   }
   return { trace, times };
 }
 
 self.onmessage = async (e) => {
-  const { label, sizeGB, durationMs, preload } = e.data;
+  // stopFlag: optional Int32Array on a SharedArrayBuffer; the page sets [0] = 1 to stop
+  const { label, sizeGB, durationMs, preload, stopFlag } = e.data;
   // [수정] 에러가 나도 핸들을 닫을 수 있도록 밖으로 뺐다.
   let accessHandle = null;
   try {
@@ -164,21 +166,35 @@ self.onmessage = async (e) => {
 
     // Recorded with the trace so every saved run states the size it really used.
     const fileSizeBytes = accessHandle.getSize();
+    const untilStopped = !Number.isFinite(durationMs);
     self.postMessage({
       type: "status",
-      msg: `Verified ${(fileSizeBytes / BYTES_PER_GB).toFixed(2)} GB file. Measuring (${durationMs / 1000}s)...`,
+      msg: `Verified ${(fileSizeBytes / BYTES_PER_GB).toFixed(2)} GB file. ` +
+        (untilStopped ? "Measuring until stopped..." : `Measuring (${durationMs / 1000}s)...`),
     });
     // Tells the page the recording window starts now (used by auto mode to
-    // open the target link at a fixed offset from this moment).
-    self.postMessage({ type: "measuring" });
-    const { trace, times } = measureTrace(accessHandle, durationMs, (n) =>
-      self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
+    // open the target link at a fixed offset from this moment). startEpochMs
+    // is the same moment on the wall clock, so events logged elsewhere (e.g.
+    // website visits) can be placed on the trace's time axis.
+    const start = performance.now();
+    const startEpochMs = performance.timeOrigin + start;
+    self.postMessage({ type: "measuring", startEpochMs });
+    const { trace, times } = measureTrace(accessHandle, durationMs, start, stopFlag, (n, elapsedMs) =>
+      self.postMessage({
+        type: "status",
+        msg: `Measuring... ${n} samples` + (untilStopped ? `, ${(elapsedMs / 1000).toFixed(0)} s` : ""),
+      })
     );
     accessHandle.close();
     accessHandle = null;
 
     // [수정] 측정 조건(sizeGB, durationMs)을 메인 스레드로 다시 돌려보낸다. 서버 저장에 쓰인다.
-    self.postMessage({ type: "done", label, trace, times, sizeGB, fileSizeBytes, durationMs, preload: !!preload });
+    // A recording that ran until stopped reports how long it actually ran.
+    const recordedMs = untilStopped ? Math.round(performance.now() - start) : durationMs;
+    self.postMessage({
+      type: "done", label, trace, times, sizeGB, fileSizeBytes, durationMs: recordedMs,
+      preload: !!preload, startEpochMs,
+    });
   } catch (err) {
     // [수정] 에러 시에도 핸들을 닫아서, 다음 측정에서 파일이 잠겨 있는 문제를 막는다.
     if (accessHandle) accessHandle.close();

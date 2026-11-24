@@ -3,7 +3,9 @@
 
 // onMeasureStart: optional callback fired the instant the worker starts recording.
 // extra: optional object merged into the /submit payload (auto-mode metadata).
-function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMeasureStart, extra }) {
+// stopFlag: optional Int32Array on a SharedArrayBuffer; set [0] = 1 to end the
+// recording early (long recordings pass durationMs = Infinity and stop this way).
+function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMeasureStart, extra, stopFlag }) {
   return new Promise((resolve, reject) => {
     // [수정] 측정 시작 시각을 기록한다. 나중에 측정 순서나 시간대를 확인할 때 쓴다.
     const startedAt = new Date().toISOString();
@@ -18,7 +20,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
       }
 
       if (msg.type === "measuring") {
-        if (onMeasureStart) onMeasureStart();
+        if (onMeasureStart) onMeasureStart(msg);
         return;
       }
 
@@ -45,6 +47,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
               fileSizeBytes: msg.fileSizeBytes,
               durationMs: msg.durationMs,
               preload: msg.preload,
+              startEpochMs: msg.startEpochMs,
               session,
               startedAt,
               userAgent: navigator.userAgent,
@@ -62,7 +65,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
             `Done. Saved ${result.samples} samples under label "${msg.label}". ` +
             `File ${gb} GB, preload ${msg.preload ? "on" : "off"}, ${ramPct}% of reads from RAM.`
           );
-          resolve(msg.trace);
+          resolve({ trace: msg.trace, ...result });  // result: server reply (samples, visits)
         } catch (err) {
           reject(err);
         }
@@ -74,7 +77,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
       reject(new Error(e.message || "worker error"));
     };
 
-    worker.postMessage({ label, sizeGB, durationMs, preload: !!preload });
+    worker.postMessage({ label, sizeGB, durationMs, preload: !!preload, stopFlag });
   });
 }
 
