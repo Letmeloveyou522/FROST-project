@@ -139,8 +139,45 @@ function measureTrace(accessHandle, durationMs, onTick) {
   return { trace, times };
 }
 
+// EXPERIMENT: same measurement, but nothing is allocated inside the loop.
+// The loop above grows two JS arrays (periodic reallocation + copy), creates
+// two strings per read with toFixed(), and posts a status message every 200
+// reads; all of that makes garbage the engine must collect while recording.
+// Here results go into preallocated Float64Arrays and are rounded afterwards.
+function measureTraceLean(accessHandle, durationMs) {
+  // Upper bound on reads: one per 20 us is far faster than any real read
+  const cap = Math.ceil(durationMs * 50);
+  const lat = new Float64Array(cap);
+  const at = new Float64Array(cap);
+  const fileSize = accessHandle.getSize();
+  const maxOffset = fileSize - READ_SIZE;
+  const buf = new Uint8Array(READ_SIZE);
+  const opts = { at: 0 };
+  let n = 0;
+  const start = performance.now();
+
+  while (n < cap) {
+    const t0 = performance.now();
+    if (t0 - start >= durationMs) break;
+    opts.at = Math.floor(Math.random() * maxOffset);
+    accessHandle.read(buf, opts);
+    const t1 = performance.now();
+    lat[n] = t1 - t0;
+    at[n] = t0 - start;
+    n++;
+  }
+
+  const trace = new Array(n);
+  const times = new Array(n);
+  for (let i = 0; i < n; i++) {
+    trace[i] = Math.round(lat[i] * 1e4) / 1e4;
+    times[i] = Math.round(at[i] * 1e3) / 1e3;
+  }
+  return { trace, times };
+}
+
 self.onmessage = async (e) => {
-  const { label, sizeGB, durationMs, preload } = e.data;
+  const { label, sizeGB, durationMs, preload, lean } = e.data;
   // [수정] 에러가 나도 핸들을 닫을 수 있도록 밖으로 뺐다.
   let accessHandle = null;
   try {
@@ -171,14 +208,16 @@ self.onmessage = async (e) => {
     // Tells the page the recording window starts now (used by auto mode to
     // open the target link at a fixed offset from this moment).
     self.postMessage({ type: "measuring" });
-    const { trace, times } = measureTrace(accessHandle, durationMs, (n) =>
-      self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
-    );
+    const { trace, times } = lean
+      ? measureTraceLean(accessHandle, durationMs)
+      : measureTrace(accessHandle, durationMs, (n) =>
+          self.postMessage({ type: "status", msg: `Measuring... ${n} samples` })
+        );
     accessHandle.close();
     accessHandle = null;
 
     // [수정] 측정 조건(sizeGB, durationMs)을 메인 스레드로 다시 돌려보낸다. 서버 저장에 쓰인다.
-    self.postMessage({ type: "done", label, trace, times, sizeGB, fileSizeBytes, durationMs, preload: !!preload });
+    self.postMessage({ type: "done", label, trace, times, sizeGB, fileSizeBytes, durationMs, preload: !!preload, lean: !!lean });
   } catch (err) {
     // [수정] 에러 시에도 핸들을 닫아서, 다음 측정에서 파일이 잠겨 있는 문제를 막는다.
     if (accessHandle) accessHandle.close();

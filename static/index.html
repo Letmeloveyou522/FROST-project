@@ -47,6 +47,11 @@
     Preload the whole file into RAM before recording (RAM-only baseline; leave off for normal FROST traces)
   </label>
 
+  <label>
+    <input id="leanLoop" type="checkbox" checked />
+    Allocation-free recording loop (recommended; uncheck only to reproduce old data, whose loop's garbage collection adds latency bumps at ~1.7 s and ~6.5 s)
+  </label>
+
   <button id="runBtn">Start Measurement</button>
 
   <h3 style="margin-top: 32px;">Auto collection</h3>
@@ -111,6 +116,7 @@
           sizeGB,
           durationMs,
           preload,
+          lean: document.getElementById("leanLoop").checked,
           session,
           onStatus: (msg) => { statusEl.textContent = msg; },
         });
@@ -209,6 +215,7 @@
               sizeGB,
               durationMs,
               preload,
+              lean: document.getElementById("leanLoop").checked,
               session,
               onStatus: (msg) => { statusEl.textContent = prefix + msg; },
               // Fired the instant recording starts; the server opens the

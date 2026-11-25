@@ -31,6 +31,7 @@ META_FIELDS = [
     "fileSizeBytes",  # real size of the measured file, verified by the worker
     "durationMs",
     "preload",  # True: whole file was read into RAM right before recording
+    "leanLoop",  # True: recorded with the allocation-free loop (experiment)
     "startedAt",
     "userAgent",
     # Auto-mode fields (None for manual runs)

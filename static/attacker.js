@@ -3,7 +3,8 @@
 
 // onMeasureStart: optional callback fired the instant the worker starts recording.
 // extra: optional object merged into the /submit payload (auto-mode metadata).
-function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMeasureStart, extra }) {
+// lean: optional, record with the allocation-free loop (experiment).
+function runAttack({ label, sizeGB, durationMs, preload, lean, session, onStatus, onMeasureStart, extra }) {
   return new Promise((resolve, reject) => {
     // [수정] 측정 시작 시각을 기록한다. 나중에 측정 순서나 시간대를 확인할 때 쓴다.
     const startedAt = new Date().toISOString();
@@ -45,6 +46,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
               fileSizeBytes: msg.fileSizeBytes,
               durationMs: msg.durationMs,
               preload: msg.preload,
+              leanLoop: msg.lean,
               session,
               startedAt,
               userAgent: navigator.userAgent,
@@ -74,7 +76,7 @@ function runAttack({ label, sizeGB, durationMs, preload, session, onStatus, onMe
       reject(new Error(e.message || "worker error"));
     };
 
-    worker.postMessage({ label, sizeGB, durationMs, preload: !!preload });
+    worker.postMessage({ label, sizeGB, durationMs, preload: !!preload, lean: !!lean });
   });
 }
 
