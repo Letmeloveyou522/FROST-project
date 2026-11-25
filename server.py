@@ -507,8 +507,26 @@ def submit():
         for key in TIMING_FIELDS:
             record[key] = trial.get(key)
 
-    # Append, never overwrite, one file per label
     label = record["label"]
+
+    # Recording mode: record.html sends a sessionId; save the long trace with
+    # its ground-truth visit timeline under data/recordings/ instead.
+    rec_sid = data.get("sessionId")
+    if rec_sid:
+        sess = _rec_end(rec_sid, remove=True)
+        if sess:
+            record["visits"] = sess["visits"]
+        _rec_teardown()
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        rec_file = RECORDINGS_DIR / f"{label}.jsonl"
+        with rec_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        nvis = len(record.get("visits") or [])
+        print(f"[rec] saved recording label={label} samples={len(record['trace'])} "
+              f"visits={nvis} -> {rec_file}")
+        return jsonify({"samples": len(record["trace"]), "visits": nvis})
+
+    # Append, never overwrite, one file per label
     trace_file = DATA_DIR / f"{label}.jsonl"
     with trace_file.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -520,6 +538,165 @@ def submit():
     )
 
     return jsonify({"samples": len(record["trace"])})
+
+
+# ---------------------------------------------------------------------------
+# Recording mode (end-to-end sequence attack): record ONE long trace while
+# opening a planned list of sites in sequence, logging when each really opened
+# and closed. Drives static/record.html. Saves to data/recordings/<label>.jsonl
+# with a "visits" ground-truth timeline for the detector notebook.
+# ---------------------------------------------------------------------------
+
+RECORDINGS_DIR = DATA_DIR / "recordings"
+_rec_sessions = {}
+_rec_lock = threading.Lock()
+
+
+def _rec_open(sid, i):
+    with _rec_lock:
+        sess = _rec_sessions.get(sid)
+        if sess is None:
+            return
+        v = sess["visits"][i]
+        v["openCmdOffsetMs"] = _ms_since(sess["t0"])
+        url = v["url"]
+    try:
+        tab = _cdp("/json/new?" + quote(url, safe=""), method="PUT")
+        tab_id = tab["id"]
+        err = None
+    except Exception as e:  # noqa: BLE001
+        tab_id, err = None, str(e)
+    with _rec_lock:
+        sess = _rec_sessions.get(sid)
+        if sess is None:
+            return
+        v = sess["visits"][i]
+        v["tabId"] = tab_id
+        v["openError"] = err
+        v["openedOffsetMs"] = _ms_since(sess["t0"])
+    print(f"[rec] opened {url} at +{v['openedOffsetMs']} ms" if not err
+          else f"[rec] open failed: {err}")
+
+
+def _rec_close(sid, i):
+    with _rec_lock:
+        sess = _rec_sessions.get(sid)
+        if sess is None:
+            return
+        tab_id = sess["visits"][i].get("tabId")
+    if tab_id:
+        try:
+            _cdp(f"/json/close/{tab_id}")
+        except Exception as e:  # noqa: BLE001
+            print(f"[rec] close failed: {e}")
+        with _rec_lock:
+            sess = _rec_sessions.get(sid)
+            if sess is not None:
+                sess["visits"][i]["closedOffsetMs"] = _ms_since(sess["t0"])
+    # Keep the measurement tab hidden during the gap before the next visit
+    if KEEP_MEASUREMENT_IN_BACKGROUND:
+        with _trials_lock:
+            try:
+                _show_cover_tab()
+            except Exception as e:  # noqa: BLE001
+                print(f"[rec] show cover failed: {e}")
+
+
+def _rec_end(sid, remove=True):
+    """Cancel timers and close any still-open tabs. Returns the session dict."""
+    with _rec_lock:
+        sess = _rec_sessions.pop(sid, None) if remove else _rec_sessions.get(sid)
+    if sess is None:
+        return None
+    for t in sess["timers"]:
+        t.cancel()
+    for v in sess["visits"]:
+        if v.get("tabId") and not v.get("closedOffsetMs"):
+            try:
+                _cdp(f"/json/close/{v['tabId']}")
+            except Exception:  # noqa: BLE001
+                pass
+            v["closedOffsetMs"] = _ms_since(sess["t0"])
+    return sess
+
+
+def _rec_teardown():
+    """Remove the cover tab and bring the measurement tab back to the front."""
+    if not KEEP_MEASUREMENT_IN_BACKGROUND:
+        return
+    with _trials_lock:
+        _close_cover_tab()
+    try:
+        m = _find_measurement_tab()
+        if m:
+            _cdp(f"/json/activate/{m}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.route("/rec/config")
+def rec_config():
+    try:
+        found = _find_measurement_tab() is not None
+    except Exception:  # noqa: BLE001
+        return jsonify({"cdp": False, "measurementTab": False})
+    if found and KEEP_MEASUREMENT_IN_BACKGROUND:
+        try:
+            with _trials_lock:
+                _show_cover_tab()
+            print(f"[rec] measurement tab moved to the background ({COVER_TAB_URL} in front)")
+        except Exception as e:  # noqa: BLE001
+            print(f"[rec] failed to show cover tab: {e}")
+    return jsonify({"cdp": True, "measurementTab": found})
+
+
+@app.route("/rec/reset-cache", methods=["POST"])
+def rec_reset_cache():
+    try:
+        seconds = reset_page_cache()
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": str(e)}), 500
+    print(f"[rec] page cache reset ({seconds}s)")
+    return jsonify({"status": "ok"})
+
+
+@app.route("/rec/start", methods=["POST"])
+def rec_start():
+    t0 = time.perf_counter()
+    data = request.get_json(silent=True) or {}
+    visits = data.get("visits")
+    if not isinstance(visits, list) or not visits:
+        return jsonify({"error": "visits must be a non-empty list"}), 400
+
+    vlist = []
+    for v in visits:
+        url = (v or {}).get("url")
+        if not isinstance(url, str) or not re.match(r"^https?://\S+$", url):
+            return jsonify({"error": f"bad url: {url!r}"}), 400
+        vlist.append({
+            "site": v.get("site"), "url": url,
+            "openMs": v.get("openMs"), "closeMs": v.get("closeMs"),
+        })
+
+    sid = uuid.uuid4().hex
+    timers = []
+    with _rec_lock:
+        _rec_sessions[sid] = {"t0": t0, "visits": vlist, "timers": timers}
+    for i, v in enumerate(vlist):
+        ot = threading.Timer(v["openMs"] / 1000, _rec_open, args=[sid, i])
+        ct = threading.Timer(v["closeMs"] / 1000, _rec_close, args=[sid, i])
+        timers += [ot, ct]
+        ot.start(); ct.start()
+    print(f"[rec] session {sid[:8]} scheduled {len(vlist)} visits")
+    return jsonify({"sessionId": sid})
+
+
+@app.route("/rec/stop", methods=["POST"])
+def rec_stop():
+    data = request.get_json(silent=True) or {}
+    _rec_end(data.get("sessionId"), remove=True)
+    _rec_teardown()
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":

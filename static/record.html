@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FROST — 연속 녹화</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         max-width: 720px; margin: 32px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { font-size: 22px; } h2 { font-size: 15px; margin-top: 24px; }
+  label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 13px; }
+  input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  .row { display: flex; gap: 12px; } .row > div { flex: 1; }
+  button { margin-top: 18px; padding: 11px 20px; font-size: 15px; font-weight: 600;
+           border: none; border-radius: 8px; cursor: pointer; }
+  #start { background: #2a78d6; color: #fff; } #stop { background: #eee; }
+  #log { margin-top: 20px; padding: 14px; background: #f6f6f4; border-radius: 8px;
+         font: 13px ui-monospace, Menlo, monospace; white-space: pre-wrap; min-height: 80px; }
+  .note { color: #888; font-size: 12px; margin-top: 6px; }
+  table { border-collapse: collapse; margin-top: 8px; font-size: 13px; width: 100%; }
+  td, th { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
+</style>
+</head>
+<body>
+<h1>FROST — 연속 녹화 (end-to-end 공격)</h1>
+<p class="note">긴 trace 하나를 녹화하면서, 아래 사이트들을 순서대로 자동으로 열고 정답을 기록합니다.
+학습 데이터와 동일 설정: 30GB · preload off · cacheReset on · 열림 전 5초 settle.</p>
+
+<label>저장 라벨 (파일명)</label>
+<input id="label" value="recording_1">
+
+<div class="row">
+  <div><label>파일 크기 (GB)</label><input id="sizeGB" type="number" value="30"></div>
+  <div><label>방문 사이트 (순서, 쉼표)</label><input id="sites" value="google,chatgpt,youtube,figma,coupang"></div>
+</div>
+<div class="row">
+  <div><label>방문 길이 (초)</label><input id="visit" type="number" value="8"></div>
+  <div><label>간격 (초)</label><input id="gap" type="number" value="12"></div>
+  <div><label>시작 전 여유 (초)</label><input id="lead" type="number" value="12"></div>
+</div>
+
+<h2>측정 계획 (미리보기)</h2>
+<div id="plan"></div>
+
+<button id="start">녹화 시작</button>
+<button id="stop" disabled>중지</button>
+
+<div id="log">대기 중…</div>
+
+<script src="/attacker.js"></script>
+<script>
+const SITE_URLS = {
+  chatgpt:  "https://chatgpt.com",
+  coupang:  "https://www.coupang.com",
+  figma:    "https://www.figma.com",
+  google:   "https://www.google.com",
+  instagram:"https://www.instagram.com",
+  navermap: "https://map.naver.com",
+  youtube:  "https://www.youtube.com",
+};
+
+const $ = id => document.getElementById(id);
+const log = m => { $("log").textContent += "\n" + m; };
+
+function buildPlan() {
+  const sites = $("sites").value.split(",").map(s => s.trim()).filter(Boolean);
+  const visit = +$("visit").value * 1000, gap = +$("gap").value * 1000, lead = +$("lead").value * 1000;
+  const visits = [];
+  let t = lead;
+  for (const site of sites) {
+    const url = SITE_URLS[site];
+    if (!url) { log("⚠ 알 수 없는 사이트: " + site + " (무시)"); continue; }
+    visits.push({ site, url, openMs: t, closeMs: t + visit });
+    t += visit + gap;
+  }
+  const durationMs = t + lead;   // 끝에도 여유
+  return { visits, durationMs };
+}
+
+function renderPlan() {
+  const { visits, durationMs } = buildPlan();
+  let html = `<table><tr><th>#</th><th>사이트</th><th>열림(s)</th><th>닫힘(s)</th></tr>`;
+  visits.forEach((v, i) => html += `<tr><td>${i+1}</td><td>${v.site}</td><td>${v.openMs/1000}</td><td>${v.closeMs/1000}</td></tr>`);
+  html += `</table><p class="note">총 녹화 길이: ${durationMs/1000}초</p>`;
+  $("plan").innerHTML = html;
+}
+["sites","visit","gap","lead"].forEach(id => $(id).addEventListener("input", renderPlan));
+renderPlan();
+
+let sessionId = null;
+
+$("start").onclick = async () => {
+  $("start").disabled = true; $("stop").disabled = false;
+  $("log").textContent = "준비 중…";
+  const { visits, durationMs } = buildPlan();
+  const label = $("label").value.trim();
+  const sizeGB = +$("sizeGB").value;
+
+  try {
+    // 1) 측정 탭을 뒤로 숨기기
+    await fetch("/rec/config");
+    // 2) 페이지 캐시 리셋 (학습과 동일)
+    log("페이지 캐시 리셋…");
+    const rc = await fetch("/rec/reset-cache", { method: "POST" });
+    if (!rc.ok) { log("⚠ 캐시 리셋 실패: " + (await rc.json()).error); }
+    // 3) 5초 settle
+    log("5초 안정화…");
+    await new Promise(r => setTimeout(r, 5000));
+
+    // 4) 녹화 시작 (measuring 순간에 사이트 오픈 예약)
+    const extra = { cacheReset: true };
+    log(`녹화 시작 (${durationMs/1000}초)…`);
+    await runAttack({
+      label, sizeGB, durationMs, preload: false, session: "record",
+      onStatus: m => $("log").textContent = $("log").textContent.split("\n").slice(0,-1).concat(m).join("\n"),
+      onMeasureStart: async () => {
+        const r = await fetch("/rec/start", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ visits })
+        });
+        const j = await r.json();
+        sessionId = j.sessionId;
+        extra.sessionId = sessionId;
+        log("▶ 측정 시작됨 — 사이트들이 자동으로 열립니다");
+      },
+      extra,
+    });
+    log("✅ 저장 완료! data/recordings/" + label + ".jsonl");
+  } catch (e) {
+    log("❌ 오류: " + e.message);
+  } finally {
+    $("start").disabled = false; $("stop").disabled = true;
+  }
+};
+
+$("stop").onclick = async () => {
+  if (sessionId) await fetch("/rec/stop", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId })
+  });
+  log("중지 요청됨");
+  $("stop").disabled = true;
+};
+</script>
+</body>
+</html>

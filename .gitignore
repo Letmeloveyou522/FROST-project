@@ -2,3 +2,9 @@
 __pycache__/
 traces*.jsonl
 **/.DS_Store
+
+# 배포용 데이터 묶음 (깃에 안 올림)
+data.zip
+.auto_profile/
+data/
+figures/
